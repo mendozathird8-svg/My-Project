@@ -15,8 +15,21 @@ from tkinter import filedialog, messagebox
 import numpy as np
 
 
+# ============================================================
+# ManiaTK
+# 4K osu!mania-inspired rhythm game
+# Python 3.14 compatible
+# No pygame
+#
+# IMPORTANT:
+# - Menu buttons are real Tkinter buttons and are rebuilt
+#   whenever the screen changes.
+# - Notes are locked to a detected beat grid.
+# - Audio is played with FFplay.
+# ============================================================
+
 APP_NAME = "ManiaTK"
-GAME_VERSION = "1.0.3"
+GAME_VERSION = "1.0.4"
 
 DEFAULT_NOTE_SPEED = 420
 MIN_NOTE_SPEED = 180
@@ -24,15 +37,46 @@ MAX_NOTE_SPEED = 900
 
 DEFAULT_KEYS = ["d", "f", "j", "k"]
 
-FFMPEG_NAMES = [
-    "ffmpeg.exe",
-    "ffmpeg",
-]
+LANES = 4
 
-FFPLAY_NAMES = [
-    "ffplay.exe",
-    "ffplay",
-]
+DIFFICULTIES = {
+    "Easy": {
+        "threshold": 0.72,
+        "subdivision": 1,
+        "min_spacing": 0.50,
+        "chords": False,
+    },
+    "Normal": {
+        "threshold": 0.58,
+        "subdivision": 1,
+        "min_spacing": 0.25,
+        "chords": False,
+    },
+    "Hard": {
+        "threshold": 0.47,
+        "subdivision": 2,
+        "min_spacing": 0.125,
+        "chords": True,
+    },
+    "Insane": {
+        "threshold": 0.39,
+        "subdivision": 2,
+        "min_spacing": 0.125,
+        "chords": True,
+    },
+    "Extreme": {
+        "threshold": 0.31,
+        "subdivision": 4,
+        "min_spacing": 0.0625,
+        "chords": True,
+    },
+    "Osu Pro": {
+        "threshold": 0.24,
+        "subdivision": 4,
+        "min_spacing": 0.0625,
+        "chords": True,
+    },
+}
 
 GITHUB_VERSION_URL = (
     "https://raw.githubusercontent.com/"
@@ -40,99 +84,84 @@ GITHUB_VERSION_URL = (
 )
 
 
-DIFFICULTIES = {
-    "EASY": {
-        "threshold": 78,
-        "subdivision": 1,
-        "min_spacing": 0.50,
-        "chords": False,
-        "jumps": False,
-    },
-    "NORMAL": {
-        "threshold": 64,
-        "subdivision": 1,
-        "min_spacing": 0.25,
-        "chords": True,
-        "jumps": False,
-    },
-    "HARD": {
-        "threshold": 52,
-        "subdivision": 2,
-        "min_spacing": 0.125,
-        "chords": True,
-        "jumps": True,
-    },
-    "INSANE": {
-        "threshold": 42,
-        "subdivision": 2,
-        "min_spacing": 0.125,
-        "chords": True,
-        "jumps": True,
-    },
-    "EXTREME": {
-        "threshold": 31,
-        "subdivision": 4,
-        "min_spacing": 0.0625,
-        "chords": True,
-        "jumps": True,
-    },
-    "OSU PRO": {
-        "threshold": 20,
-        "subdivision": 4,
-        "min_spacing": 0.0625,
-        "chords": True,
-        "jumps": True,
-    },
-}
+# ============================================================
+# Utility
+# ============================================================
 
+def resource_path(filename):
+    base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, filename)
+
+
+def find_program(names):
+    for name in names:
+        path = shutil.which(name)
+        if path:
+            return path
+
+        local = resource_path(name)
+        if os.path.exists(local):
+            return local
+
+    return None
+
+
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+# ============================================================
+# FFPLAY AUDIO PLAYER
+# ============================================================
 
 class AudioPlayer:
     def __init__(self):
         self.process = None
+        self.file = None
         self.position = 0.0
         self.started_at = None
         self.paused = False
-        self.file = None
 
-    def find_program(self, names):
-        locations = []
+        self.ffplay = find_program([
+            "ffplay.exe",
+            "ffplay"
+        ])
 
-        here = os.path.dirname(os.path.abspath(sys.argv[0]))
-        locations.append(here)
+    def available(self):
+        return self.ffplay is not None
 
-        path_value = os.environ.get("PATH", "")
-        locations.extend(path_value.split(os.pathsep))
+    def stop_process(self):
+        if self.process:
+            try:
+                if self.process.poll() is None:
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=0.5)
+                    except Exception:
+                        self.process.kill()
+            except Exception:
+                pass
 
-        for folder in locations:
-            if not folder:
-                continue
+        self.process = None
 
-            for name in names:
-                path = os.path.join(folder, name)
-
-                if os.path.isfile(path):
-                    return path
-
-        return None
-
-    def play(self, filename, start_position=0.0):
-        self.stop()
-
-        ffplay = self.find_program(FFPLAY_NAMES)
-
-        if not ffplay:
+    def play(self, filename, position=0.0):
+        if not self.ffplay:
             raise RuntimeError(
                 "FFplay was not found.\n\n"
                 "Install FFmpeg and make sure ffplay.exe is available."
             )
 
+        self.stop_process()
+
         self.file = filename
-        self.position = max(0.0, float(start_position))
+        self.position = max(0.0, position)
         self.paused = False
-        self.started_at = time.perf_counter()
 
         command = [
-            ffplay,
+            self.ffplay,
             "-nodisp",
             "-autoexit",
             "-loglevel",
@@ -143,14 +172,22 @@ class AudioPlayer:
             filename,
         ]
 
-        self.process = subprocess.Popen(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW
-            if os.name == "nt"
-            else 0,
-        )
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(
+                    subprocess,
+                    "CREATE_NO_WINDOW",
+                    0
+                ),
+            )
+        except Exception as e:
+            self.process = None
+            raise RuntimeError(
+                "Could not start FFplay:\n\n" + str(e)
+            )
 
         self.started_at = time.perf_counter()
 
@@ -158,96 +195,86 @@ class AudioPlayer:
         if self.paused:
             return self.position
 
-        if self.started_at is None:
-            return self.position
+        if self.started_at is not None:
+            return self.position + (
+                time.perf_counter() - self.started_at
+            )
 
-        if self.process is not None:
-            if self.process.poll() is not None:
-                return self.position
-
-        return self.position + (
-            time.perf_counter() - self.started_at
-        )
+        return self.position
 
     def pause(self):
-        if self.process is None:
-            return
-
-        if self.paused:
+        if not self.process:
             return
 
         self.position = self.get_position()
         self.paused = True
 
-        try:
-            self.process.terminate()
-            self.process.wait(timeout=0.5)
-        except Exception:
-            try:
-                self.process.kill()
-            except Exception:
-                pass
-
-        self.process = None
+        self.stop_process()
+        self.started_at = None
 
     def resume(self):
-        if not self.paused or not self.file:
+        if not self.file:
             return
 
-        self.play(self.file, self.position)
+        self.play(
+            self.file,
+            self.position
+        )
 
     def stop(self):
-        if self.process is not None:
-            try:
-                self.process.terminate()
-                self.process.wait(timeout=0.5)
-            except Exception:
-                try:
-                    self.process.kill()
-                except Exception:
-                    pass
-
-        self.process = None
-        self.started_at = None
+        self.stop_process()
         self.position = 0.0
+        self.started_at = None
         self.paused = False
+        self.file = None
 
+
+# ============================================================
+# MAIN GAME
+# ============================================================
 
 class ManiaTK:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title(APP_NAME)
-        self.root.geometry("1000x700")
-        self.root.minsize(900, 620)
-        self.root.configure(bg="#080000")
+        self.root.title(
+            f"{APP_NAME} {GAME_VERSION}"
+        )
+
+        self.root.geometry("1100x700")
+        self.root.minsize(900, 600)
+
+        self.root.configure(bg="#170000")
 
         self.canvas = tk.Canvas(
             self.root,
-            bg="#080000",
-            highlightthickness=0,
+            bg="#170000",
+            highlightthickness=0
         )
-        self.canvas.pack(fill="both", expand=True)
+        self.canvas.pack(
+            fill="both",
+            expand=True
+        )
 
         self.audio = AudioPlayer()
 
         self.screen = "menu"
 
         self.song_file = None
-        self.song_name = ""
         self.wav_file = None
+        self.temp_wav = None
+        self.song_name = "No song selected"
 
-        self.samples = None
-        self.sample_rate = 44100
         self.duration = 0.0
-
         self.bpm = 120.0
         self.beat_interval = 0.5
-        self.beat_offset = 0.0
+        self.beat_phase = 0.0
+
+        self.onset_times = []
+        self.onset_strengths = []
 
         self.notes = []
-        self.active_notes = []
 
-        self.difficulty = "NORMAL"
+        self.selected_difficulty = "Normal"
         self.note_speed = DEFAULT_NOTE_SPEED
 
         self.keys = DEFAULT_KEYS.copy()
@@ -255,293 +282,321 @@ class ManiaTK:
         self.score = 0
         self.combo = 0
         self.max_combo = 0
-        self.hits = 0
+
+        self.perfects = 0
+        self.greats = 0
+        self.goods = 0
+        self.okays = 0
         self.misses = 0
-        self.total_judged = 0
 
-        self.hit_effects = []
-        self.key_glow = [0, 0, 0, 0]
+        self.pressed = [False] * LANES
 
-        self.song_start_time = 0.0
-        self.paused_position = 0.0
-        self.game_finished = False
+        self.game_start_time = 0
+        self.paused_position = 0
 
-        self.menu_buttons = []
-        self.particles = []
-
-        self.dragging_key = None
-
-        self.youtube_window = None
-        self.youtube_status = None
+        self.menu_widgets = []
 
         self.analysis_running = False
+        self.analysis_status = ""
 
-        self.init_particles()
-
-        self.root.protocol("WM_DELETE_WINDOW", self.close)
-
-        self.show_menu()
-        self.game_loop()
-
-    # =========================================================
-    # BASIC UI
-    # =========================================================
-
-    def clear(self):
-        self.canvas.delete("all")
-        self.menu_buttons = []
-
-    def center(self):
-        return (
-            self.canvas.winfo_width() / 2,
-            self.canvas.winfo_height() / 2,
-        )
-
-    def text(
-        self,
-        x,
-        y,
-        value,
-        size=20,
-        fill="white",
-        anchor="center",
-        weight="bold",
-    ):
-        return self.canvas.create_text(
-            x,
-            y,
-            text=value,
-            fill=fill,
-            font=("Arial", size, weight),
-            anchor=anchor,
-        )
-
-    def button(
-        self,
-        x1,
-        y1,
-        x2,
-        y2,
-        label,
-        command,
-        font=("Arial", 15, "bold"),
-    ):
-        tag = f"button_{len(self.menu_buttons)}"
-
-        rect = self.canvas.create_rectangle(
-            x1,
-            y1,
-            x2,
-            y2,
-            fill="#210000",
-            outline="#ff2020",
-            width=2,
-            tags=tag,
-        )
-
-        text_id = self.canvas.create_text(
-            (x1 + x2) / 2,
-            (y1 + y2) / 2,
-            text=label,
-            fill="white",
-            font=font,
-        )
-
-        self.canvas.tag_bind(
-            tag,
-            "<Button-1>",
-            lambda e: command(),
-        )
-
-        self.canvas.tag_bind(
-            tag,
-            "<Enter>",
-            lambda e, r=rect: self.canvas.itemconfigure(
-                r,
-                fill="#4a0000",
-            ),
-        )
-
-        self.canvas.tag_bind(
-            tag,
-            "<Leave>",
-            lambda e, r=rect: self.canvas.itemconfigure(
-                r,
-                fill="#210000",
-            ),
-        )
-
-        self.canvas.tag_bind(
-            text_id,
-            "<Button-1>",
-            lambda e: command(),
-        )
-
-        self.canvas.tag_bind(
-            text_id,
-            "<Enter>",
-            lambda e, r=rect: self.canvas.itemconfigure(
-                r,
-                fill="#4a0000",
-            ),
-        )
-
-        self.canvas.tag_bind(
-            text_id,
-            "<Leave>",
-            lambda e, r=rect: self.canvas.itemconfigure(
-                r,
-                fill="#210000",
-            ),
-        )
-
-        self.menu_buttons.append(tag)
-
-    # =========================================================
-    # PARTICLES
-    # =========================================================
-
-    def init_particles(self):
         self.particles = []
 
-        for _ in range(70):
-            self.particles.append(
-                {
-                    "x": random.random(),
-                    "y": random.random(),
-                    "speed": random.uniform(0.0005, 0.002),
-                    "size": random.uniform(1, 4),
-                }
-            )
+        for _ in range(100):
+            self.particles.append({
+                "x": random.random(),
+                "y": random.random(),
+                "speed": random.uniform(
+                    0.0002,
+                    0.0012
+                ),
+                "size": random.randint(
+                    1,
+                    3
+                )
+            })
+
+        self.root.bind(
+            "<KeyPress>",
+            self.key_down
+        )
+
+        self.root.bind(
+            "<KeyRelease>",
+            self.key_up
+        )
+
+        self.root.protocol(
+            "WM_DELETE_WINDOW",
+            self.close
+        )
+
+        self.show_menu()
+
+        self.animate()
+
+    # ========================================================
+    # BACKGROUND
+    # ========================================================
 
     def draw_background(self):
-        width = max(1, self.canvas.winfo_width())
-        height = max(1, self.canvas.winfo_height())
+        self.canvas.delete("background")
+
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+
+        if width <= 1:
+            return
 
         self.canvas.create_rectangle(
             0,
             0,
             width,
             height,
-            fill="#080000",
+            fill="#170000",
             outline="",
+            tags="background"
         )
 
-        for particle in self.particles:
-            particle["y"] += particle["speed"]
+        # Subtle red glow
+        for i in range(8):
+            margin = i * 30
 
-            if particle["y"] > 1:
-                particle["y"] = 0
-                particle["x"] = random.random()
-
-            x = particle["x"] * width
-            y = particle["y"] * height
-            size = particle["size"]
-
-            self.canvas.create_oval(
-                x - size,
-                y - size,
-                x + size,
-                y + size,
-                fill="white",
-                outline="",
+            self.canvas.create_rectangle(
+                margin,
+                margin,
+                width - margin,
+                height - margin,
+                outline="#2a0000",
+                tags="background"
             )
 
-    # =========================================================
-    # MENU
-    # =========================================================
+        # Particles
+        for p in self.particles:
+            x = p["x"] * width
+            y = p["y"] * height
+
+            self.canvas.create_oval(
+                x,
+                y,
+                x + p["size"],
+                y + p["size"],
+                fill="white",
+                outline="",
+                tags="background"
+            )
+
+    def animate(self):
+        for p in self.particles:
+            p["y"] += p["speed"]
+
+            if p["y"] > 1.05:
+                p["y"] = -0.05
+                p["x"] = random.random()
+
+        self.draw_background()
+
+        if self.screen == "game":
+            self.draw_game()
+
+        elif self.screen == "pause":
+            self.draw_pause()
+
+        elif self.screen == "results":
+            self.draw_results()
+
+        elif self.screen == "analysis":
+            self.draw_analysis()
+
+        self.root.after(
+            33,
+            self.animate
+        )
+
+    # ========================================================
+    # SCREEN HELPERS
+    # ========================================================
+
+    def clear_widgets(self):
+        for widget in self.menu_widgets:
+            try:
+                widget.destroy()
+            except Exception:
+                pass
+
+        self.menu_widgets.clear()
+
+    def set_screen(self, screen):
+        self.clear_widgets()
+        self.screen = screen
+
+    def make_button(
+        self,
+        text,
+        command,
+        x,
+        y,
+        width=300,
+        height=52
+    ):
+        button = tk.Button(
+            self.root,
+            text=text,
+            command=command,
+            font=(
+                "Arial",
+                15,
+                "bold"
+            ),
+            fg="white",
+            bg="#6d0000",
+            activeforeground="white",
+            activebackground="#b00000",
+            relief="flat",
+            bd=0,
+            cursor="hand2"
+        )
+
+        button.place(
+            relx=x,
+            rely=y,
+            anchor="center",
+            width=width,
+            height=height
+        )
+
+        self.menu_widgets.append(button)
+
+        return button
+
+    def make_label(
+        self,
+        text,
+        x,
+        y,
+        font=("Arial", 14),
+        fg="white"
+    ):
+        label = tk.Label(
+            self.root,
+            text=text,
+            font=font,
+            fg=fg,
+            bg="#170000"
+        )
+
+        label.place(
+            relx=x,
+            rely=y,
+            anchor="center"
+        )
+
+        self.menu_widgets.append(label)
+
+        return label
+
+    # ========================================================
+    # MAIN MENU
+    # ========================================================
 
     def show_menu(self):
-        self.screen = "menu"
-        self.audio.stop()
+        self.set_screen("menu")
 
-        self.clear()
-
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
-
-        cx = width / 2
-
-        self.text(
-            cx,
-            75,
+        self.make_label(
             "MANIATK",
-            48,
+            0.5,
+            0.10,
+            font=(
+                "Arial",
+                42,
+                "bold"
+            )
         )
 
-        self.text(
-            cx,
-            120,
-            "4K rhythm game",
-            16,
-            "#ffaaaa",
+        self.make_label(
+            "4K Rhythm Game",
+            0.5,
+            0.17,
+            font=(
+                "Arial",
+                16
+            ),
+            fg="#dddddd"
         )
 
-        self.button(
-            cx - 190,
-            175,
-            cx + 190,
-            225,
+        if self.song_file:
+            song_text = (
+                "Song: " +
+                self.song_name
+            )
+        else:
+            song_text = "Song: None"
+
+        self.make_label(
+            song_text,
+            0.5,
+            0.235,
+            font=(
+                "Arial",
+                13
+            ),
+            fg="#bbbbbb"
+        )
+
+        self.make_button(
             "IMPORT SONG / VIDEO",
             self.import_song,
+            0.5,
+            0.34
         )
 
-        self.button(
-            cx - 190,
-            240,
-            cx + 190,
-            290,
+        self.make_button(
             "PASTE YOUTUBE LINK",
-            self.import_youtube,
+            self.youtube_dialog,
+            0.5,
+            0.43
         )
 
-        self.button(
-            cx - 190,
-            305,
-            cx + 190,
-            355,
-            "DIFFICULTY",
+        self.make_button(
+            "DIFFICULTY: " +
+            self.selected_difficulty,
             self.show_difficulty,
+            0.5,
+            0.52
         )
 
-        self.button(
-            cx - 190,
-            370,
-            cx + 190,
-            420,
+        self.make_button(
             f"NOTE SPEED: {self.note_speed}",
             self.show_speed,
+            0.5,
+            0.61
         )
 
-        self.button(
-            cx - 190,
-            435,
-            cx + 190,
-            485,
+        self.make_button(
             "KEY SETTINGS",
             self.show_keys,
+            0.5,
+            0.70
         )
 
-        self.button(
-            cx - 190,
-            500,
-            cx + 190,
-            550,
+        self.make_button(
             "TUTORIAL",
             self.show_tutorial,
+            0.5,
+            0.79
         )
 
-        self.text(
-            cx,
-            height - 35,
-            f"ManiaTK {GAME_VERSION}",
-            12,
-            "#888888",
+        self.make_button(
+            "QUIT",
+            self.close,
+            0.5,
+            0.88,
+            width=180,
+            height=44
         )
 
-    # =========================================================
-    # SONG IMPORT
-    # =========================================================
+    # ========================================================
+    # IMPORT
+    # ========================================================
 
     def import_song(self):
         filename = filedialog.askopenfilename(
@@ -549,38 +604,403 @@ class ManiaTK:
             filetypes=[
                 (
                     "Media files",
-                    "*.mp3 *.wav *.ogg *.m4a *.flac "
-                    "*.wma *.mp4 *.mkv *.avi",
+                    "*.mp3 *.mp4 *.wav *.ogg "
+                    "*.m4a *.wma *.flac *.avi *.mkv"
                 ),
-                ("All files", "*.*"),
-            ],
+                (
+                    "All files",
+                    "*.*"
+                ),
+            ]
         )
 
         if not filename:
             return
 
         self.song_file = filename
-        self.song_name = os.path.basename(filename)
+        self.song_name = os.path.basename(
+            filename
+        )
 
         self.start_analysis()
 
-    def find_ffmpeg(self):
-        return self.audio.find_program(FFMPEG_NAMES)
+    # ========================================================
+    # YOUTUBE
+    # ========================================================
+
+    def youtube_dialog(self):
+        window = tk.Toplevel(self.root)
+
+        window.title(
+            "YouTube Song"
+        )
+
+        window.geometry(
+            "600x190"
+        )
+
+        window.configure(
+            bg="#170000"
+        )
+
+        tk.Label(
+            window,
+            text="Paste YouTube URL",
+            font=(
+                "Arial",
+                18,
+                "bold"
+            ),
+            fg="white",
+            bg="#170000"
+        ).pack(
+            pady=20
+        )
+
+        entry = tk.Entry(
+            window,
+            font=(
+                "Arial",
+                13
+            )
+        )
+
+        entry.pack(
+            padx=30,
+            fill="x"
+        )
+
+        def download():
+            url = entry.get().strip()
+
+            if not url:
+                messagebox.showerror(
+                    "Error",
+                    "Paste a YouTube URL."
+                )
+                return
+
+            try:
+                import yt_dlp
+            except ImportError:
+                messagebox.showerror(
+                    "yt-dlp missing",
+                    "Install yt-dlp with:\n\n"
+                    'py -3.14 -m pip install -U "yt-dlp[default]"'
+                )
+                return
+
+            window.destroy()
+
+            threading.Thread(
+                target=self.download_youtube,
+                args=(url,),
+                daemon=True
+            ).start()
+
+        tk.Button(
+            window,
+            text="DOWNLOAD",
+            command=download,
+            bg="#700000",
+            fg="white",
+            activebackground="#b00000",
+            activeforeground="white",
+            relief="flat",
+            font=(
+                "Arial",
+                12,
+                "bold"
+            )
+        ).pack(
+            pady=20,
+            ipadx=30,
+            ipady=5
+        )
+
+    def download_youtube(self, url):
+        try:
+            import yt_dlp
+
+            folder = os.path.join(
+                tempfile.gettempdir(),
+                "ManiaTK"
+            )
+
+            os.makedirs(
+                folder,
+                exist_ok=True
+            )
+
+            output = os.path.join(
+                folder,
+                "youtube_audio.%(ext)s"
+            )
+
+            options = {
+                "format":
+                    "bestaudio[ext=m4a]/"
+                    "bestaudio/best",
+
+                "outtmpl":
+                    output,
+
+                "noplaylist":
+                    True,
+
+                "quiet":
+                    True,
+
+                "no_warnings":
+                    True,
+
+                "restrictfilenames":
+                    True,
+            }
+
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(
+                    url,
+                    download=True
+                )
+
+                filename = ydl.prepare_filename(
+                    info
+                )
+
+            self.root.after(
+                0,
+                lambda: self.youtube_finished(
+                    filename,
+                    info.get(
+                        "title",
+                        "YouTube Song"
+                    )
+                )
+            )
+
+        except Exception as e:
+            self.root.after(
+                0,
+                lambda: messagebox.showerror(
+                    "YouTube Error",
+                    str(e)
+                )
+            )
+
+    def youtube_finished(
+        self,
+        filename,
+        title
+    ):
+        if not os.path.exists(filename):
+            messagebox.showerror(
+                "Error",
+                "YouTube download failed."
+            )
+            return
+
+        self.song_file = filename
+        self.song_name = title
+
+        self.start_analysis()
+
+    # ========================================================
+    # ANALYSIS
+    # ========================================================
+
+    def start_analysis(self):
+        if not self.song_file:
+            messagebox.showwarning(
+                "No song",
+                "Import a song or video first."
+            )
+            return
+
+        self.set_screen("analysis")
+
+        self.analysis_running = True
+        self.analysis_status = (
+            "Converting audio..."
+        )
+
+        threading.Thread(
+            target=self.analysis_worker,
+            daemon=True
+        ).start()
+
+    def analysis_worker(self):
+        try:
+            wav_file = self.convert_to_wav(
+                self.song_file
+            )
+
+            samples, sample_rate, duration = (
+                self.read_wav(wav_file)
+            )
+
+            self.analysis_status = (
+                "Detecting rhythm..."
+            )
+
+            envelope, hop = (
+                self.make_onset_envelope(
+                    samples,
+                    sample_rate
+                )
+            )
+
+            self.analysis_status = (
+                "Estimating BPM..."
+            )
+
+            bpm = self.estimate_bpm(
+                envelope,
+                hop,
+                sample_rate
+            )
+
+            interval, bpm = (
+                self.optimize_beat_interval(
+                    envelope,
+                    hop,
+                    sample_rate,
+                    bpm
+                )
+            )
+
+            phase = self.find_beat_phase(
+                envelope,
+                hop,
+                sample_rate,
+                interval
+            )
+
+            self.duration = duration
+            self.bpm = bpm
+            self.beat_interval = interval
+            self.beat_phase = phase
+
+            self.onset_times = (
+                np.arange(
+                    len(envelope)
+                ) *
+                hop /
+                sample_rate
+            )
+
+            self.onset_strengths = envelope
+
+            self.wav_file = wav_file
+
+            self.analysis_status = (
+                "Building rhythm-locked chart..."
+            )
+
+            self.notes = (
+                self.generate_rhythm_locked_chart(
+                    envelope,
+                    hop,
+                    sample_rate,
+                    duration
+                )
+            )
+
+            self.analysis_running = False
+
+            self.root.after(
+                0,
+                self.analysis_finished
+            )
+
+        except Exception as e:
+            self.analysis_running = False
+
+            self.root.after(
+                0,
+                lambda err=str(e):
+                    messagebox.showerror(
+                        "Analysis Error",
+                        err
+                    )
+            )
+
+            self.root.after(
+                0,
+                self.show_menu
+            )
+
+    def analysis_finished(self):
+        self.show_difficulty()
+
+    def draw_analysis(self):
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+
+        self.canvas.create_text(
+            width / 2,
+            height * 0.38,
+            text="ANALYZING SONG",
+            fill="white",
+            font=(
+                "Arial",
+                30,
+                "bold"
+            )
+        )
+
+        self.canvas.create_text(
+            width / 2,
+            height * 0.48,
+            text=self.analysis_status,
+            fill="#dddddd",
+            font=(
+                "Arial",
+                16
+            )
+        )
+
+        self.canvas.create_text(
+            width / 2,
+            height * 0.58,
+            text="Please wait...",
+            fill="#888888",
+            font=(
+                "Arial",
+                13
+            )
+        )
+
+    # ========================================================
+    # FFMPEG
+    # ========================================================
 
     def convert_to_wav(self, filename):
-        ffmpeg = self.find_ffmpeg()
+        ffmpeg = find_program([
+            "ffmpeg.exe",
+            "ffmpeg"
+        ])
 
         if not ffmpeg:
             raise RuntimeError(
                 "FFmpeg was not found.\n\n"
-                "Install FFmpeg and make sure ffmpeg.exe is available."
+                "Install FFmpeg and make sure ffmpeg.exe "
+                "is available."
             )
 
-        temp_dir = tempfile.mkdtemp(prefix="maniatk_")
+        temp_dir = os.path.join(
+            tempfile.gettempdir(),
+            "ManiaTK"
+        )
+
+        os.makedirs(
+            temp_dir,
+            exist_ok=True
+        )
 
         output = os.path.join(
             temp_dir,
-            "audio.wav",
+            "mania_audio.wav"
         )
 
         command = [
@@ -602,183 +1022,96 @@ class ManiaTK:
             command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            creationflags=subprocess.CREATE_NO_WINDOW
-            if os.name == "nt"
-            else 0,
+            creationflags=getattr(
+                subprocess,
+                "CREATE_NO_WINDOW",
+                0
+            )
         )
 
-        if result.returncode != 0 or not os.path.isfile(output):
+        if result.returncode != 0:
             error = result.stderr.decode(
                 errors="ignore"
             )
 
             raise RuntimeError(
                 "FFmpeg could not convert the file.\n\n"
-                + error[-1500:]
+                + error[-2000:]
             )
 
         return output
 
     def read_wav(self, filename):
-        with wave.open(filename, "rb") as wav:
+        with wave.open(
+            filename,
+            "rb"
+        ) as wav:
             channels = wav.getnchannels()
             sample_width = wav.getsampwidth()
             sample_rate = wav.getframerate()
             frames = wav.getnframes()
 
-            raw = wav.readframes(frames)
+            raw = wav.readframes(
+                frames
+            )
 
-        if sample_width == 2:
+        if sample_width == 1:
             data = np.frombuffer(
                 raw,
-                dtype=np.int16,
-            ).astype(np.float32)
+                dtype=np.uint8
+            ).astype(
+                np.float32
+            )
 
-            data /= 32768.0
+            data = (
+                data - 128
+            ) / 128.0
 
-        elif sample_width == 1:
+        elif sample_width == 2:
             data = np.frombuffer(
                 raw,
-                dtype=np.uint8,
-            ).astype(np.float32)
-
-            data = (data - 128.0) / 128.0
+                dtype=np.int16
+            ).astype(
+                np.float32
+            ) / 32768.0
 
         elif sample_width == 4:
             data = np.frombuffer(
                 raw,
-                dtype=np.int32,
-            ).astype(np.float32)
-
-            data /= 2147483648.0
+                dtype=np.int32
+            ).astype(
+                np.float32
+            ) / 2147483648.0
 
         else:
             raise RuntimeError(
-                f"Unsupported WAV sample width: {sample_width}"
+                "Unsupported WAV sample format."
             )
 
         if channels > 1:
-            data = data.reshape(-1, channels)
-            data = np.mean(data, axis=1)
+            data = data.reshape(
+                -1,
+                channels
+            ).mean(
+                axis=1
+            )
 
-        return data, sample_rate
+        duration = len(data) / sample_rate
 
-    # =========================================================
-    # ANALYSIS
-    # =========================================================
-
-    def start_analysis(self):
-        if self.analysis_running:
-            return
-
-        self.analysis_running = True
-        self.screen = "analysis"
-
-        self.clear()
-
-        cx, cy = self.center()
-
-        self.text(
-            cx,
-            cy - 50,
-            "ANALYZING RHYTHM...",
-            32,
+        return (
+            data,
+            sample_rate,
+            duration
         )
 
-        self.text(
-            cx,
-            cy + 5,
-            "Finding BPM and beat phase",
-            17,
-            "#ffaaaa",
-        )
-
-        self.text(
-            cx,
-            cy + 45,
-            "Notes will be locked to the detected beat grid.",
-            14,
-            "#aaaaaa",
-        )
-
-        threading.Thread(
-            target=self.analysis_worker,
-            daemon=True,
-        ).start()
-
-    def analysis_worker(self):
-        try:
-            self.wav_file = self.convert_to_wav(
-                self.song_file
-            )
-
-            samples, sample_rate = self.read_wav(
-                self.wav_file
-            )
-
-            self.samples = samples
-            self.sample_rate = sample_rate
-            self.duration = len(samples) / sample_rate
-
-            if self.duration < 1.0:
-                raise RuntimeError(
-                    "The song is too short."
-                )
-
-            envelope, frame_time = self.make_onset_envelope(
-                samples,
-                sample_rate,
-            )
-
-            bpm = self.estimate_bpm(
-                envelope,
-                frame_time,
-            )
-
-            bpm, beat = self.optimize_beat_interval(
-                envelope,
-                frame_time,
-                bpm,
-            )
-
-            offset = self.find_beat_phase(
-                envelope,
-                frame_time,
-                beat,
-            )
-
-            self.bpm = bpm
-            self.beat_interval = beat
-            self.beat_offset = offset
-
-            self.notes = self.generate_rhythm_locked_chart(
-                envelope,
-                frame_time,
-                bpm,
-                beat,
-                offset,
-                self.difficulty,
-            )
-
-            self.root.after(
-                0,
-                self.analysis_finished,
-            )
-
-        except Exception as exc:
-            self.root.after(
-                0,
-                lambda e=exc: self.analysis_failed(e),
-            )
-
-    # =========================================================
-    # ONSET ENVELOPE
-    # =========================================================
+    # ========================================================
+    # AUDIO ANALYSIS
+    # ========================================================
 
     def make_onset_envelope(
         self,
         samples,
-        sample_rate,
+        sample_rate
     ):
         frame_size = 2048
         hop = 256
@@ -786,16 +1119,29 @@ class ManiaTK:
         if len(samples) < frame_size:
             samples = np.pad(
                 samples,
-                (0, frame_size - len(samples)),
+                (
+                    0,
+                    frame_size - len(samples)
+                )
             )
 
-        window = np.hanning(frame_size)
-
-        count = 1 + (
-            (len(samples) - frame_size) // hop
+        window = np.hanning(
+            frame_size
         )
 
-        envelope = np.zeros(count)
+        count = (
+            1 +
+            (
+                len(samples) -
+                frame_size
+            ) //
+            hop
+        )
+
+        envelope = np.zeros(
+            count,
+            dtype=np.float32
+        )
 
         previous = None
 
@@ -809,7 +1155,11 @@ class ManiaTK:
             if len(frame) < frame_size:
                 frame = np.pad(
                     frame,
-                    (0, frame_size - len(frame)),
+                    (
+                        0,
+                        frame_size -
+                        len(frame)
+                    )
                 )
 
             frame = frame * window
@@ -822,295 +1172,287 @@ class ManiaTK:
                 spectrum
             )
 
-            if previous is not None:
-                diff = spectrum - previous
-                diff[diff < 0] = 0
-
-                value = float(
-                    np.sum(diff)
-                )
+            if previous is None:
+                flux = 0.0
             else:
-                value = 0.0
+                difference = (
+                    spectrum -
+                    previous
+                )
+
+                flux = np.sum(
+                    np.maximum(
+                        difference,
+                        0
+                    )
+                )
 
             previous = spectrum
 
-            envelope[i] = value
+            envelope[i] = flux
 
-        envelope = self.smooth_array(
-            envelope,
-            3,
-        )
-
-        if np.max(envelope) > 0:
-            envelope /= np.max(envelope)
-
-        return envelope, hop / sample_rate
-
-    def smooth_array(self, values, radius):
-        if radius <= 0:
-            return values
-
+        # Smooth the envelope.
         kernel = np.ones(
-            radius * 2 + 1
-        ) / (
-            radius * 2 + 1
-        )
+            5,
+            dtype=np.float32
+        ) / 5.0
 
-        return np.convolve(
-            values,
+        envelope = np.convolve(
+            envelope,
             kernel,
-            mode="same",
+            mode="same"
         )
 
-    # =========================================================
-    # BPM DETECTION
-    # =========================================================
+        low = np.percentile(
+            envelope,
+            5
+        )
+
+        high = np.percentile(
+            envelope,
+            95
+        )
+
+        envelope = (
+            envelope - low
+        ) / (
+            high - low + 1e-9
+        )
+
+        envelope = np.clip(
+            envelope,
+            0,
+            1
+        )
+
+        return (
+            envelope,
+            hop
+        )
 
     def estimate_bpm(
         self,
         envelope,
-        frame_time,
+        hop,
+        sample_rate
     ):
         if len(envelope) < 10:
             return 120.0
 
-        envelope = envelope - np.mean(envelope)
-
-        if np.max(np.abs(envelope)) <= 0:
-            return 120.0
-
-        min_bpm = 65.0
-        max_bpm = 190.0
-
-        min_lag = int(
-            (60.0 / max_bpm) / frame_time
+        signal = (
+            envelope -
+            np.mean(envelope)
         )
 
-        max_lag = int(
-            (60.0 / min_bpm) / frame_time
-        )
+        min_bpm = 65
+        max_bpm = 190
 
-        max_lag = min(
-            max_lag,
-            len(envelope) - 1,
-        )
+        best_bpm = 120
+        best_score = -1e30
 
-        if min_lag >= max_lag:
-            return 120.0
-
-        correlations = []
-
-        for lag in range(
-            min_lag,
-            max_lag + 1,
+        for bpm in np.linspace(
+            min_bpm,
+            max_bpm,
+            251
         ):
-            a = envelope[:-lag]
-            b = envelope[lag:]
-
-            denominator = (
-                np.linalg.norm(a)
-                * np.linalg.norm(b)
+            interval = (
+                60.0 /
+                bpm
             )
 
-            if denominator <= 0:
-                score = 0.0
-            else:
-                score = float(
-                    np.dot(a, b)
-                    / denominator
+            lag = max(
+                1,
+                int(
+                    interval *
+                    sample_rate /
+                    hop
                 )
-
-            correlations.append(
-                score
             )
 
-        correlations = np.asarray(
-            correlations
-        )
-
-        best_index = int(
-            np.argmax(correlations)
-        )
-
-        lag = min_lag + best_index
-
-        bpm = 60.0 / (
-            lag * frame_time
-        )
-
-        return float(
-            np.clip(
-                bpm,
-                min_bpm,
-                max_bpm,
-            )
-        )
-
-    def optimize_beat_interval(
-        self,
-        envelope,
-        frame_time,
-        estimated_bpm,
-    ):
-        candidates = []
-
-        base_values = [
-            estimated_bpm / 2.0,
-            estimated_bpm,
-            estimated_bpm * 2.0,
-        ]
-
-        for base in base_values:
-            if base < 65 or base > 190:
+            if lag >= len(signal):
                 continue
 
-            for delta in np.linspace(
-                -0.03,
-                0.03,
-                13,
-            ):
-                bpm = base * (1.0 + delta)
+            a = signal[:-lag]
+            b = signal[lag:]
 
-                if 65 <= bpm <= 190:
-                    candidates.append(bpm)
-
-        if not candidates:
-            candidates = [120.0]
-
-        best_bpm = 120.0
-        best_score = -999999.0
-
-        for bpm in candidates:
-            beat = 60.0 / bpm
-
-            score = self.beat_grid_quality(
-                envelope,
-                frame_time,
-                beat,
+            score = float(
+                np.dot(
+                    a,
+                    b
+                )
             )
 
             if score > best_score:
                 best_score = score
                 best_bpm = bpm
 
-        return (
-            float(best_bpm),
-            60.0 / float(best_bpm),
-        )
+        return float(best_bpm)
 
     def beat_grid_quality(
         self,
         envelope,
-        frame_time,
-        beat,
+        hop,
+        sample_rate,
+        interval
     ):
-        if beat <= 0:
+        if interval <= 0:
             return -999999
 
-        max_time = len(envelope) * frame_time
-
-        if max_time < beat * 4:
-            return -999999
-
-        phases = np.linspace(
-            0,
-            beat,
-            25,
-            endpoint=False,
+        beat_frames = (
+            interval *
+            sample_rate /
+            hop
         )
 
-        best = -999999.0
+        if beat_frames < 1:
+            return -999999
 
-        for phase in phases:
-            times = np.arange(
-                phase,
-                max_time,
-                beat,
+        positions = np.arange(
+            0,
+            len(envelope),
+            beat_frames
+        )
+
+        indices = np.round(
+            positions
+        ).astype(int)
+
+        indices = indices[
+            indices < len(envelope)
+        ]
+
+        if len(indices) < 4:
+            return -999999
+
+        values = envelope[
+            indices
+        ]
+
+        return float(
+            np.mean(values) +
+            0.25 *
+            np.std(values)
+        )
+
+    def optimize_beat_interval(
+        self,
+        envelope,
+        hop,
+        sample_rate,
+        bpm
+    ):
+        candidates = []
+
+        for multiplier in (
+            0.5,
+            1.0,
+            2.0
+        ):
+            candidate_bpm = (
+                bpm *
+                multiplier
             )
 
-            if len(times) < 4:
+            if not (
+                55 <= candidate_bpm <= 220
+            ):
                 continue
 
-            indices = np.rint(
-                times / frame_time
-            ).astype(int)
+            for adjustment in np.linspace(
+                0.97,
+                1.03,
+                13
+            ):
+                test_bpm = (
+                    candidate_bpm *
+                    adjustment
+                )
 
-            indices = indices[
-                (indices >= 0)
-                & (indices < len(envelope))
-            ]
+                interval = (
+                    60.0 /
+                    test_bpm
+                )
 
-            if len(indices) < 4:
-                continue
+                quality = (
+                    self.beat_grid_quality(
+                        envelope,
+                        hop,
+                        sample_rate,
+                        interval
+                    )
+                )
 
-            values = envelope[
-                indices
-            ]
+                candidates.append(
+                    (
+                        quality,
+                        interval,
+                        test_bpm
+                    )
+                )
 
-            mean = float(
-                np.mean(values)
+        if not candidates:
+            return (
+                0.5,
+                120.0
             )
 
-            deviation = float(
-                np.std(values)
-            )
+        candidates.sort(
+            reverse=True
+        )
 
-            # We want strong energy at the
-            # grid positions, but not a grid
-            # that is only occasionally huge.
-            score = (
-                mean * 2.0
-                + deviation * 0.35
-            )
+        _, interval, final_bpm = (
+            candidates[0]
+        )
 
-            if score > best:
-                best = score
-
-        return best
-
-    # =========================================================
-    # BEAT PHASE
-    # =========================================================
+        return (
+            interval,
+            final_bpm
+        )
 
     def find_beat_phase(
         self,
         envelope,
-        frame_time,
-        beat,
+        hop,
+        sample_rate,
+        interval
     ):
-        max_time = len(envelope) * frame_time
+        beat_frames = (
+            interval *
+            sample_rate /
+            hop
+        )
 
         best_phase = 0.0
-        best_score = -999999.0
+        best_score = -999999
 
-        # Fine phase search.
-        # This is the important part that keeps
-        # the generated chart synchronized with
-        # the actual rhythm instead of assuming
-        # that beat 1 starts at exactly 0.0.
-        steps = 120
+        phase_count = 120
 
-        for i in range(steps):
+        for p in range(
+            phase_count
+        ):
             phase = (
-                beat * i / steps
+                p /
+                phase_count
+            ) * interval
+
+            start_frame = (
+                phase *
+                sample_rate /
+                hop
             )
 
-            times = np.arange(
-                phase,
-                max_time,
-                beat,
+            positions = np.arange(
+                start_frame,
+                len(envelope),
+                beat_frames
             )
 
-            if len(times) < 4:
-                continue
-
-            indices = np.rint(
-                times / frame_time
+            indices = np.round(
+                positions
             ).astype(int)
 
             indices = indices[
-                (indices >= 0)
-                & (indices < len(envelope))
+                indices < len(envelope)
             ]
 
             if len(indices) < 4:
@@ -1120,1312 +1462,1286 @@ class ManiaTK:
                 indices
             ]
 
-            # Also look slightly around the
-            # exact beat because the onset can
-            # happen a few milliseconds before
-            # or after the detected beat.
-            expanded = []
-
-            radius = max(
-                1,
-                int(
-                    0.035
-                    / frame_time
-                ),
-            )
-
-            for index in indices:
-                lo = max(
-                    0,
-                    index - radius,
-                )
-
-                hi = min(
-                    len(envelope),
-                    index + radius + 1,
-                )
-
-                expanded.append(
-                    float(
-                        np.max(
-                            envelope[lo:hi]
-                        )
-                    )
-                )
-
-            expanded = np.asarray(
-                expanded
-            )
-
             score = (
                 float(np.mean(values))
-                * 0.7
-                + float(np.mean(expanded))
-                * 1.3
+                +
+                0.20 *
+                float(np.std(values))
             )
 
             if score > best_score:
                 best_score = score
                 best_phase = phase
 
-        return float(best_phase)
+        return best_phase
 
-    # =========================================================
+    # ========================================================
     # RHYTHM-LOCKED CHART GENERATOR
-    # =========================================================
+    # ========================================================
 
     def generate_rhythm_locked_chart(
         self,
         envelope,
-        frame_time,
-        bpm,
-        beat,
-        offset,
-        difficulty,
+        hop,
+        sample_rate,
+        duration
     ):
         settings = DIFFICULTIES[
-            difficulty
+            self.selected_difficulty
         ]
 
         subdivision = settings[
             "subdivision"
         ]
 
-        # Every possible note time is generated
-        # from this exact mathematical grid.
-        step = beat / subdivision
-
-        max_time = (
-            len(envelope)
-            * frame_time
-        )
-
-        start_time = max(
-            0.0,
-            offset,
-        )
-
-        grid_times = []
-
-        current = start_time
-
-        while current < max_time - 0.05:
-            grid_times.append(
-                current
-            )
-            current += step
-
-        if not grid_times:
-            return []
-
-        grid_strengths = []
-
-        # Measure the audio around each grid
-        # position instead of moving the note
-        # to the audio peak.
-        radius_seconds = min(
-            0.060,
-            beat * 0.12,
-        )
-
-        radius_frames = max(
-            1,
-            int(
-                radius_seconds
-                / frame_time
-            ),
-        )
-
-        for t in grid_times:
-            index = int(
-                round(
-                    t / frame_time
-                )
-            )
-
-            lo = max(
-                0,
-                index - radius_frames,
-            )
-
-            hi = min(
-                len(envelope),
-                index + radius_frames + 1,
-            )
-
-            if lo >= hi:
-                strength = 0.0
-            else:
-                # Maximum local onset energy is
-                # more useful than the exact center
-                # because drums often peak slightly
-                # before the beat.
-                strength = float(
-                    np.max(
-                        envelope[lo:hi]
-                    )
-                )
-
-            grid_strengths.append(
-                strength
-            )
-
-        grid_strengths = np.asarray(
-            grid_strengths,
-            dtype=np.float32,
-        )
-
-        if len(grid_strengths) == 0:
-            return []
-
-        # Remove very weak background energy.
-        baseline = float(
-            np.percentile(
-                grid_strengths,
-                25,
-            )
-        )
-
-        high = float(
-            np.percentile(
-                grid_strengths,
-                95,
-            )
-        )
-
-        if high <= baseline:
-            high = baseline + 0.001
-
-        normalized = (
-            (grid_strengths - baseline)
-            / (high - baseline)
-        )
-
-        normalized = np.clip(
-            normalized,
-            0.0,
-            1.0,
-        )
-
-        # Difficulty controls density.
         threshold = settings[
             "threshold"
-        ] / 100.0
+        ]
 
-        notes = []
+        min_spacing = settings[
+            "min_spacing"
+        ]
 
-        last_time = -999.0
-        last_lane = -1
+        allow_chords = settings[
+            "chords"
+        ]
 
-        for index, t in enumerate(
-            grid_times
-        ):
-            strength = float(
-                normalized[index]
+        beat = self.beat_interval
+        step = beat / subdivision
+
+        # ----------------------------------------------------
+        # Normalize onset data.
+        # ----------------------------------------------------
+
+        energies = np.asarray(
+            envelope,
+            dtype=np.float32
+        )
+
+        if len(energies) == 0:
+            return []
+
+        # ----------------------------------------------------
+        # Find strong local peaks.
+        #
+        # These peaks do NOT become note times directly.
+        # Instead they are used to decide which positions
+        # on the mathematical beat grid should contain notes.
+        # ----------------------------------------------------
+
+        peak_window = max(
+            2,
+            int(
+                0.080 *
+                sample_rate /
+                hop
             )
+        )
 
-            if strength < threshold:
-                continue
+        peak_positions = []
+
+        for i in range(
+            peak_window,
+            len(energies) -
+            peak_window
+        ):
+            value = energies[i]
+
+            left = energies[
+                i - peak_window:i
+            ]
+
+            right = energies[
+                i + 1:
+                i + 1 + peak_window
+            ]
 
             if (
-                t - last_time
-                < settings["min_spacing"]
+                value >= np.max(left)
+                and
+                value >= np.max(right)
             ):
-                continue
+                peak_positions.append(
+                    (
+                        i *
+                        hop /
+                        sample_rate,
+                        float(value)
+                    )
+                )
 
-            # Do not make notes too close to
-            # the beginning/end of the song.
-            if t < 0.05:
-                continue
+        # ----------------------------------------------------
+        # Build exact grid.
+        # ----------------------------------------------------
 
-            if t > max_time - 0.08:
-                continue
+        grid = []
 
-            lanes = self.choose_lanes(
-                index,
-                strength,
-                last_lane,
-                settings,
+        t = self.beat_phase
+
+        while t < duration:
+            if t >= 0:
+                grid.append(t)
+
+            t += step
+
+        # ----------------------------------------------------
+        # For every grid point, find nearby audio energy.
+        # This makes the chart rhythm-locked.
+        # ----------------------------------------------------
+
+        notes_by_time = {}
+
+        last_note_time = -999.0
+
+        for grid_time in grid:
+            search_window = min(
+                0.060,
+                step * 0.30
             )
 
-            if not lanes:
-                continue
+            best_strength = 0.0
 
-            # IMPORTANT:
-            # All lanes in a chord have the EXACT
-            # SAME t. No random timing offsets.
-            for lane in lanes:
-                notes.append(
-                    {
-                        "time": float(t),
-                        "lane": int(lane),
-                        "hit": False,
-                        "missed": False,
-                    }
+            for peak_time, strength in peak_positions:
+                difference = abs(
+                    peak_time -
+                    grid_time
                 )
 
-            last_time = t
-            last_lane = lanes[-1]
+                if difference <= search_window:
+                    if strength > best_strength:
+                        best_strength = strength
 
-        return notes
+            # Dynamic threshold depending on section energy.
+            local_start = max(
+                0,
+                int(
+                    (
+                        grid_time -
+                        0.50
+                    ) *
+                    sample_rate /
+                    hop
+                )
+            )
 
-    def choose_lanes(
-        self,
-        index,
-        strength,
-        last_lane,
-        settings,
-    ):
-        pattern = [
-            0,
-            1,
-            2,
-            3,
-            2,
-            1,
-            0,
-            1,
-            2,
-            3,
-        ]
+            local_end = min(
+                len(energies),
+                int(
+                    (
+                        grid_time +
+                        0.50
+                    ) *
+                    sample_rate /
+                    hop
+                )
+            )
 
-        primary = pattern[
-            index % len(pattern)
-        ]
-
-        if primary == last_lane:
-            primary = (
-                primary + 1
-            ) % 4
-
-        lanes = [primary]
-
-        if not settings["chords"]:
-            return lanes
-
-        if settings["jumps"]:
-            # Strong events can become chords,
-            # but the chord remains exactly on
-            # the beat grid.
-            if strength > 0.78:
-                chord_patterns = [
-                    [0, 2],
-                    [1, 3],
-                    [0, 3],
-                    [1, 2],
+            if local_end > local_start:
+                local = energies[
+                    local_start:local_end
                 ]
 
-                chord = chord_patterns[
-                    index
-                    % len(chord_patterns)
-                ]
-
-                if primary not in chord:
-                    chord = [
-                        primary,
-                        chord[1],
-                    ]
-
-                lanes = sorted(
-                    set(chord)
+                local_average = float(
+                    np.mean(local)
                 )
 
-            elif strength > 0.60:
-                if index % 5 == 0:
-                    other = (
-                        primary + 2
-                    ) % 4
+                local_max = float(
+                    np.max(local)
+                )
 
-                    lanes = sorted(
-                        {
-                            primary,
-                            other,
-                        }
+                # The threshold is based on both the
+                # global difficulty and local song energy.
+                required = (
+                    threshold *
+                    (
+                        0.55 +
+                        0.45 *
+                        local_average
+                    )
+                )
+
+                required *= (
+                    0.80 +
+                    0.20 *
+                    local_max
+                )
+
+            else:
+                required = threshold
+
+            # ------------------------------------------------
+            # Strong peaks can activate a grid slot.
+            # ------------------------------------------------
+
+            if best_strength >= required:
+                if (
+                    grid_time -
+                    last_note_time
+                ) < min_spacing:
+                    continue
+
+                notes_by_time[
+                    round(
+                        grid_time,
+                        6
+                    )
+                ] = best_strength
+
+                last_note_time = grid_time
+
+        # ----------------------------------------------------
+        # Add stronger subdivisions in harder difficulties.
+        # ----------------------------------------------------
+
+        if subdivision >= 2:
+            # Look at every grid slot and allow especially
+            # strong audio peaks through.
+            for grid_time in grid:
+                if grid_time in notes_by_time:
+                    continue
+
+                best_strength = 0.0
+
+                for peak_time, strength in peak_positions:
+                    difference = abs(
+                        peak_time -
+                        grid_time
                     )
 
-        return lanes
+                    if difference <= (
+                        step * 0.28
+                    ):
+                        best_strength = max(
+                            best_strength,
+                            strength
+                        )
 
-    # =========================================================
-    # ANALYSIS COMPLETE
-    # =========================================================
+                if best_strength >= (
+                    threshold * 1.30
+                ):
+                    notes_by_time[
+                        round(
+                            grid_time,
+                            6
+                        )
+                    ] = best_strength
 
-    def analysis_finished(self):
-        self.analysis_running = False
+        # ----------------------------------------------------
+        # Sort exact rhythm positions.
+        # ----------------------------------------------------
 
-        self.screen = "difficulty"
-
-        self.show_difficulty()
-
-    def analysis_failed(self, error):
-        self.analysis_running = False
-
-        self.clear()
-
-        cx, cy = self.center()
-
-        self.text(
-            cx,
-            cy - 70,
-            "ANALYSIS FAILED",
-            30,
-            "#ff4040",
+        times = sorted(
+            notes_by_time.keys()
         )
 
-        self.text(
-            cx,
-            cy - 20,
-            str(error)[:120],
-            14,
-            "white",
+        # ----------------------------------------------------
+        # Lane assignment.
+        #
+        # Deterministic patterns avoid random-looking charts.
+        # ----------------------------------------------------
+
+        chart = []
+
+        previous_lane = -1
+
+        for index, note_time in enumerate(
+            times
+        ):
+            strength = notes_by_time[
+                note_time
+            ]
+
+            if allow_chords:
+                # Stronger beats can become chords.
+                is_chord = (
+                    strength >=
+                    max(
+                        0.80,
+                        threshold + 0.25
+                    )
+                    and
+                    index % 4 == 0
+                )
+            else:
+                is_chord = False
+
+            # Musical-ish repeating lane pattern.
+            pattern = [
+                0, 1, 2, 3,
+                1, 3, 0, 2,
+                3, 2, 1, 0,
+            ]
+
+            lane = pattern[
+                index %
+                len(pattern)
+            ]
+
+            if lane == previous_lane:
+                lane = (
+                    lane + 1
+                ) % LANES
+
+            lanes = [lane]
+
+            if is_chord:
+                second = (
+                    lane + 2
+                ) % LANES
+
+                lanes.append(
+                    second
+                )
+
+            for lane_number in lanes:
+                chart.append({
+                    "time": note_time,
+                    "lane": lane_number,
+                    "hit": False,
+                    "missed": False,
+                    "judgement": None,
+                })
+
+            previous_lane = lane
+
+        chart.sort(
+            key=lambda n: (
+                n["time"],
+                n["lane"]
+            )
         )
 
-        self.button(
-            cx - 150,
-            cy + 45,
-            cx + 150,
-            cy + 95,
-            "BACK",
-            self.show_menu,
-        )
+        return chart
 
-    # =========================================================
+    # ========================================================
     # DIFFICULTY
-    # =========================================================
+    # ========================================================
 
     def show_difficulty(self):
-        self.screen = "difficulty"
-
-        self.clear()
-
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
-        cx = width / 2
-
-        self.text(
-            cx,
-            55,
-            "SELECT DIFFICULTY",
-            34,
+        self.set_screen(
+            "difficulty"
         )
 
-        names = [
-            "EASY",
-            "NORMAL",
-            "HARD",
-            "INSANE",
-            "EXTREME",
-            "OSU PRO",
-        ]
+        self.make_label(
+            "SELECT DIFFICULTY",
+            0.5,
+            0.10,
+            font=(
+                "Arial",
+                30,
+                "bold"
+            )
+        )
 
-        descriptions = {
-            "EASY": "Quarter-beat rhythm with low density",
-            "NORMAL": "Standard rhythm",
-            "HARD": "Eighth-note rhythm",
-            "INSANE": "Dense eighth-note rhythm",
-            "EXTREME": "Sixteenth-note rhythm",
-            "OSU PRO": "Maximum density for experienced players",
-        }
+        self.make_label(
+            f"BPM: {self.bpm:.1f}",
+            0.5,
+            0.17,
+            font=(
+                "Arial",
+                13
+            ),
+            fg="#bbbbbb"
+        )
 
-        y = 105
+        names = list(
+            DIFFICULTIES.keys()
+        )
+
+        y = 0.27
 
         for name in names:
             def choose(
-                n=name
+                difficulty=name
             ):
-                self.set_difficulty(
-                    n
+                self.selected_difficulty = (
+                    difficulty
                 )
 
-            self.button(
-                cx - 230,
-                y,
-                cx + 230,
-                y + 48,
+                if self.song_file:
+                    self.rebuild_chart()
+                else:
+                    self.show_menu()
+
+            self.make_button(
                 name,
                 choose,
+                0.5,
+                y,
+                width=300,
+                height=45
             )
 
-            self.text(
-                cx,
-                y + 62,
-                descriptions[name],
-                12,
-                "#bbbbbb",
-            )
+            y += 0.09
 
-            y += 82
-
-        self.button(
-            cx - 130,
-            height - 55,
-            cx + 130,
-            height - 15,
+        self.make_button(
             "BACK",
             self.show_menu,
+            0.5,
+            0.91,
+            width=180,
+            height=40
         )
 
-    def set_difficulty(self, difficulty):
-        self.difficulty = difficulty
+    def rebuild_chart(self):
+        self.set_screen(
+            "analysis"
+        )
 
-        if self.song_file:
-            self.start_analysis()
-        else:
-            self.show_menu()
+        self.analysis_running = True
+        self.analysis_status = (
+            "Building chart..."
+        )
 
-    # =========================================================
+        threading.Thread(
+            target=self.rebuild_chart_worker,
+            daemon=True
+        ).start()
+
+    def rebuild_chart_worker(self):
+        try:
+            samples, sample_rate, duration = (
+                self.read_wav(
+                    self.wav_file
+                )
+            )
+
+            envelope, hop = (
+                self.make_onset_envelope(
+                    samples,
+                    sample_rate
+                )
+            )
+
+            self.notes = (
+                self.generate_rhythm_locked_chart(
+                    envelope,
+                    hop,
+                    sample_rate,
+                    duration
+                )
+            )
+
+            self.analysis_running = False
+
+            self.root.after(
+                0,
+                self.start_game
+            )
+
+        except Exception as e:
+            self.analysis_running = False
+
+            self.root.after(
+                0,
+                lambda err=str(e):
+                    messagebox.showerror(
+                        "Chart Error",
+                        err
+                    )
+            )
+
+            self.root.after(
+                0,
+                self.show_menu
+            )
+
+    # ========================================================
     # NOTE SPEED
-    # =========================================================
+    # ========================================================
 
     def show_speed(self):
-        self.screen = "speed"
+        self.set_screen(
+            "speed"
+        )
 
-        self.clear()
-
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
-        cx = width / 2
-
-        self.text(
-            cx,
-            70,
+        self.make_label(
             "NOTE SPEED",
-            36,
+            0.5,
+            0.15,
+            font=(
+                "Arial",
+                30,
+                "bold"
+            )
         )
 
-        self.text(
-            cx,
-            120,
+        value_label = self.make_label(
             str(self.note_speed),
-            34,
-            "#ff5555",
+            0.5,
+            0.29,
+            font=(
+                "Arial",
+                24,
+                "bold"
+            )
         )
 
-        speeds = [
-            ("SLOW", 250),
-            ("NORMAL", 420),
-            ("FAST", 600),
-            ("INSANE", 800),
-        ]
+        slider = tk.Scale(
+            self.root,
+            from_=MIN_NOTE_SPEED,
+            to=MAX_NOTE_SPEED,
+            orient="horizontal",
+            length=500,
+            bg="#170000",
+            fg="white",
+            troughcolor="#4a0000",
+            highlightthickness=0,
+            showvalue=False,
+            command=lambda value:
+                value_label.config(
+                    text=str(
+                        int(float(value))
+                    )
+                )
+        )
 
-        y = 180
+        slider.set(
+            self.note_speed
+        )
 
-        for name, speed in speeds:
-            self.button(
-                cx - 180,
-                y,
-                cx + 180,
-                y + 48,
-                f"{name}  ({speed})",
-                lambda s=speed: self.set_speed(s),
+        slider.place(
+            relx=0.5,
+            rely=0.42,
+            anchor="center"
+        )
+
+        self.menu_widgets.append(
+            slider
+        )
+
+        def save():
+            self.note_speed = int(
+                slider.get()
             )
 
-            y += 65
+            self.show_menu()
 
-        self.button(
-            cx - 180,
-            y,
-            cx - 10,
-            y + 48,
-            "-",
-            lambda: self.change_speed(-30),
+        self.make_button(
+            "SAVE",
+            save,
+            0.5,
+            0.57,
+            width=200
         )
 
-        self.button(
-            cx + 10,
-            y,
-            cx + 180,
-            y + 48,
-            "+",
-            lambda: self.change_speed(30),
-        )
-
-        self.button(
-            cx - 130,
-            height - 65,
-            cx + 130,
-            height - 20,
+        self.make_button(
             "BACK",
             self.show_menu,
+            0.5,
+            0.67,
+            width=200
         )
 
-    def set_speed(self, speed):
-        self.note_speed = speed
-        self.show_speed()
-
-    def change_speed(self, amount):
-        self.note_speed = int(
-            np.clip(
-                self.note_speed + amount,
-                MIN_NOTE_SPEED,
-                MAX_NOTE_SPEED,
-            )
-        )
-
-        self.show_speed()
-
-    # =========================================================
+    # ========================================================
     # KEY SETTINGS
-    # =========================================================
+    # ========================================================
 
     def show_keys(self):
-        self.screen = "keys"
+        self.set_screen(
+            "keys"
+        )
 
-        self.clear()
-
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
-        cx = width / 2
-
-        self.text(
-            cx,
-            65,
+        self.make_label(
             "KEY SETTINGS",
-            34,
+            0.5,
+            0.12,
+            font=(
+                "Arial",
+                30,
+                "bold"
+            )
         )
 
-        self.text(
-            cx,
-            105,
-            "Click a key and press the new keyboard key.",
-            14,
-            "#bbbbbb",
+        self.make_label(
+            "Click a key and press the new keyboard key",
+            0.5,
+            0.20,
+            font=(
+                "Arial",
+                13
+            ),
+            fg="#bbbbbb"
         )
 
-        labels = [
-            "LANE 1",
-            "LANE 2",
-            "LANE 3",
-            "LANE 4",
-        ]
+        entries = []
 
-        y = 165
-
-        for i in range(4):
-            self.text(
-                cx - 100,
-                y + 25,
-                labels[i],
-                16,
-                anchor="e",
+        for lane in range(LANES):
+            y = (
+                0.32 +
+                lane * 0.10
             )
 
-            self.button(
-                cx - 70,
+            self.make_label(
+                f"Lane {lane + 1}",
+                0.37,
                 y,
-                cx + 70,
-                y + 50,
-                self.keys[i].upper(),
-                lambda lane=i: self.capture_key(lane),
+                font=(
+                    "Arial",
+                    14,
+                    "bold"
+                )
             )
 
-            y += 75
+            entry = tk.Entry(
+                self.root,
+                justify="center",
+                font=(
+                    "Arial",
+                    14,
+                    "bold"
+                ),
+                bg="#350000",
+                fg="white",
+                insertbackground="white",
+                relief="flat"
+            )
 
-        self.button(
-            cx - 180,
-            y + 10,
-            cx - 10,
-            y + 55,
-            "RESET",
-            self.reset_keys,
+            entry.insert(
+                0,
+                self.keys[lane]
+            )
+
+            entry.place(
+                relx=0.60,
+                rely=y,
+                anchor="center",
+                width=100,
+                height=35
+            )
+
+            entries.append(entry)
+            self.menu_widgets.append(
+                entry
+            )
+
+        def save():
+            new_keys = []
+
+            for entry in entries:
+                key = entry.get().strip().lower()
+
+                if len(key) != 1:
+                    messagebox.showerror(
+                        "Invalid key",
+                        "Each lane must use exactly one key."
+                    )
+                    return
+
+                new_keys.append(
+                    key
+                )
+
+            if len(
+                set(new_keys)
+            ) != LANES:
+                messagebox.showerror(
+                    "Duplicate keys",
+                    "Each lane must have a different key."
+                )
+                return
+
+            if "escape" in new_keys:
+                messagebox.showerror(
+                    "Invalid key",
+                    "ESC is reserved for pause."
+                )
+                return
+
+            self.keys = new_keys
+
+            self.show_menu()
+
+        self.make_button(
+            "SAVE",
+            save,
+            0.5,
+            0.77,
+            width=200
         )
 
-        self.button(
-            cx + 10,
-            y + 10,
-            cx + 180,
-            y + 55,
+        self.make_button(
+            "RESET DEFAULTS",
+            self.reset_keys,
+            0.5,
+            0.85,
+            width=200
+        )
+
+        self.make_button(
             "BACK",
             self.show_menu,
+            0.5,
+            0.93,
+            width=160,
+            height=35
         )
-
-    def capture_key(self, lane):
-        self.dragging_key = lane
-
-        self.clear()
-
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
-        cx = width / 2
-
-        self.text(
-            cx,
-            height / 2 - 40,
-            f"PRESS A KEY FOR LANE {lane + 1}",
-            28,
-        )
-
-        self.text(
-            cx,
-            height / 2 + 10,
-            "ESC is reserved for pause.",
-            15,
-            "#ffaaaa",
-        )
-
-        self.root.bind(
-            "<KeyPress>",
-            self.key_capture,
-        )
-
-    def key_capture(self, event):
-        if self.dragging_key is None:
-            return
-
-        key = event.keysym.lower()
-
-        if key == "escape":
-            return
-
-        if key in self.keys:
-            messagebox.showerror(
-                "Key already used",
-                "That key is already assigned to another lane.",
-            )
-            return
-
-        lane = self.dragging_key
-
-        self.keys[lane] = key
-        self.dragging_key = None
-
-        self.root.unbind(
-            "<KeyPress>"
-        )
-
-        self.show_keys()
 
     def reset_keys(self):
         self.keys = DEFAULT_KEYS.copy()
         self.show_keys()
 
-    # =========================================================
+    # ========================================================
     # TUTORIAL
-    # =========================================================
+    # ========================================================
 
     def show_tutorial(self):
-        self.screen = "tutorial"
-
-        self.clear()
-
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
-        cx = width / 2
-
-        self.text(
-            cx,
-            65,
-            "TUTORIAL",
-            36,
+        self.set_screen(
+            "tutorial"
         )
 
-        lines = [
-            "Notes travel toward the hit line.",
-            "",
-            "Press D F J K when notes reach the line.",
-            "",
-            "PERFECT = very close",
-            "GREAT = close",
-            "GOOD = acceptable",
-            "MISS = too late",
-            "",
-            "Press ESC to pause.",
-            "",
-            "The chart generator locks note timing",
-            "to the detected musical beat grid.",
-        ]
-
-        y = 125
-
-        for line in lines:
-            self.text(
-                cx,
-                y,
-                line,
-                16,
-                "#dddddd",
+        self.make_label(
+            "HOW TO PLAY",
+            0.5,
+            0.10,
+            font=(
+                "Arial",
+                30,
+                "bold"
             )
+        )
 
-            y += 28
+        text = (
+            "Notes fall toward the hit line.\n\n"
+            "Press the matching keyboard key "
+            "when the note reaches the line.\n\n"
+            f"Lane 1 = {self.keys[0].upper()}\n"
+            f"Lane 2 = {self.keys[1].upper()}\n"
+            f"Lane 3 = {self.keys[2].upper()}\n"
+            f"Lane 4 = {self.keys[3].upper()}\n\n"
+            "ESC = Pause\n\n"
+            "Perfect = 300\n"
+            "Great = 200\n"
+            "Good = 100\n"
+            "OK = 50\n\n"
+            "Missing a note breaks your combo."
+        )
 
-        self.button(
-            cx - 130,
-            height - 70,
-            cx + 130,
-            height - 25,
+        self.make_label(
+            text,
+            0.5,
+            0.48,
+            font=(
+                "Arial",
+                15
+            )
+        )
+
+        self.make_button(
             "BACK",
             self.show_menu,
+            0.5,
+            0.88,
+            width=200
         )
 
-    # =========================================================
-    # GAME START
-    # =========================================================
+    # ========================================================
+    # KEYBOARD INPUT
+    # ========================================================
 
-    def start_game(self):
-        if not self.song_file:
+    def key_down(self, event):
+        key = event.keysym.lower()
+
+        if key == "escape":
+            if self.screen == "game":
+                self.pause_game()
+
+            elif self.screen == "pause":
+                self.resume_game()
+
             return
 
-        if not self.notes:
+        if self.screen != "game":
+            return
+
+        for lane in range(LANES):
+            if key == self.keys[lane]:
+                if not self.pressed[lane]:
+                    self.pressed[lane] = True
+                    self.hit_lane(lane)
+
+                return
+
+    def key_up(self, event):
+        key = event.keysym.lower()
+
+        for lane in range(LANES):
+            if key == self.keys[lane]:
+                self.pressed[lane] = False
+
+    # ========================================================
+    # GAME START
+    # ========================================================
+
+    def start_game(self):
+        if not self.wav_file:
             messagebox.showerror(
-                "No notes",
-                "The rhythm analyzer did not generate any notes.",
+                "Error",
+                "No analyzed audio."
             )
+            self.show_menu()
+            return
+
+        if not self.audio.available():
+            messagebox.showerror(
+                "FFplay missing",
+                "FFplay was not found."
+            )
+            self.show_menu()
             return
 
         self.score = 0
         self.combo = 0
         self.max_combo = 0
-        self.hits = 0
-        self.misses = 0
-        self.total_judged = 0
 
-        self.hit_effects = []
-        self.key_glow = [0, 0, 0, 0]
+        self.perfects = 0
+        self.greats = 0
+        self.goods = 0
+        self.okays = 0
+        self.misses = 0
 
         for note in self.notes:
             note["hit"] = False
             note["missed"] = False
+            note["judgement"] = None
 
-        self.active_notes = self.notes.copy()
+        self.pressed = [
+            False
+        ] * LANES
 
-        self.game_finished = False
+        self.set_screen(
+            "game"
+        )
 
         try:
             self.audio.play(
-                self.wav_file
+                self.wav_file,
+                0.0
             )
-        except Exception as exc:
+        except Exception as e:
             messagebox.showerror(
-                "Audio error",
-                str(exc),
+                "Audio Error",
+                str(e)
             )
+            self.show_menu()
             return
 
-        # Start the game clock at the same instant
-        # that the audio player starts its process.
-        self.song_start_time = (
+        self.game_start_time = (
             time.perf_counter()
         )
 
-        self.screen = "game"
-
-    # =========================================================
+    # ========================================================
     # GAME LOOP
-    # =========================================================
-
-    def game_loop(self):
-        try:
-            self.draw_background()
-
-            if self.screen == "menu":
-                pass
-
-            elif self.screen == "difficulty":
-                pass
-
-            elif self.screen == "speed":
-                pass
-
-            elif self.screen == "keys":
-                pass
-
-            elif self.screen == "tutorial":
-                pass
-
-            elif self.screen == "analysis":
-                self.draw_analysis_animation()
-
-            elif self.screen == "game":
-                self.draw_game()
-
-            elif self.screen == "pause":
-                self.draw_game()
-                self.draw_pause_overlay()
-
-            elif self.screen == "results":
-                pass
-
-        except tk.TclError:
-            return
-
-        self.root.after(
-            16,
-            self.game_loop,
-        )
-
-    def draw_analysis_animation(self):
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
-
-        cx = width / 2
-
-        pulse = (
-            math.sin(
-                time.perf_counter()
-                * 5
-            )
-            + 1
-        ) / 2
-
-        self.text(
-            cx,
-            height / 2 + 100,
-            "● " * int(
-                3 + pulse * 4
-            ),
-            18,
-            "#ff4040",
-        )
-
-    # =========================================================
-    # GAME DRAWING
-    # =========================================================
-
-    def draw_game(self):
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
-
-        lane_width = min(
-            130,
-            width / 5.2,
-        )
-
-        total_width = lane_width * 4
-        left = (
-            width - total_width
-        ) / 2
-
-        hit_y = height - 125
-
-        # Lane backgrounds
-        for lane in range(4):
-            x1 = (
-                left
-                + lane * lane_width
-            )
-
-            x2 = x1 + lane_width
-
-            fill = (
-                "#180000"
-                if lane % 2 == 0
-                else "#220000"
-            )
-
-            self.canvas.create_rectangle(
-                x1,
-                0,
-                x2,
-                height,
-                fill=fill,
-                outline="#300000",
-            )
-
-            if self.key_glow[lane] > 0:
-                self.canvas.create_rectangle(
-                    x1,
-                    0,
-                    x2,
-                    height,
-                    fill="#450000",
-                    outline="",
-                )
-
-        # Hit line
-        self.canvas.create_rectangle(
-            left,
-            hit_y - 4,
-            left + total_width,
-            hit_y + 4,
-            fill="#ffffff",
-            outline="",
-        )
-
-        # Lane key labels
-        for lane in range(4):
-            x = (
-                left
-                + lane * lane_width
-                + lane_width / 2
-            )
-
-            self.text(
-                x,
-                hit_y + 35,
-                self.keys[lane].upper(),
-                22,
-                "#ffffff",
-            )
-
-        position = self.audio.get_position()
-
-        # Draw notes
-        for note in self.active_notes:
-            if note["hit"] or note["missed"]:
-                continue
-
-            time_until_hit = (
-                note["time"]
-                - position
-            )
-
-            y = (
-                hit_y
-                - time_until_hit
-                * self.note_speed
-            )
-
-            if (
-                y < -100
-                or y > height + 100
-            ):
-                continue
-
-            self.draw_arrow(
-                left
-                + note["lane"]
-                * lane_width,
-                y,
-                lane_width,
-                note["lane"],
-            )
-
-        self.process_misses(
-            position
-        )
-
-        # Score
-        self.text(
-            20,
-            20,
-            f"SCORE {self.score}",
-            18,
-            anchor="w",
-        )
-
-        self.text(
-            20,
-            50,
-            f"COMBO {self.combo}",
-            18,
-            "#ffaaaa",
-            anchor="w",
-        )
-
-        self.text(
-            width - 20,
-            20,
-            f"BPM {self.bpm:.1f}",
-            16,
-            "#bbbbbb",
-            anchor="e",
-        )
-
-        self.text(
-            width - 20,
-            48,
-            self.difficulty,
-            16,
-            "#bbbbbb",
-            anchor="e",
-        )
-
-        self.draw_hit_effects()
-
-        # End only after the audio and all notes
-        # have finished.
-        if (
-            self.active_notes
-            and position
-            > self.duration + 1.0
-        ):
-            self.finish_game()
-
-    def draw_arrow(
-        self,
-        x,
-        y,
-        width,
-        lane,
-    ):
-        center_x = (
-            x + width / 2
-        )
-
-        size = min(
-            28,
-            width * 0.28,
-        )
-
-        direction = lane
-
-        if direction == 0:
-            points = [
-                center_x + size,
-                y - size,
-                center_x,
-                y,
-                center_x + size,
-                y + size,
-                center_x + size / 2,
-                y + size,
-                center_x - size / 2,
-                y + size,
-                center_x - size,
-                y,
-                center_x - size / 2,
-                y - size,
-            ]
-
-        elif direction == 1:
-            points = [
-                center_x - size,
-                y - size,
-                center_x,
-                y,
-                center_x + size,
-                y - size,
-                center_x + size,
-                y - size / 2,
-                center_x + size,
-                y + size,
-                center_x,
-                y + size / 2,
-                center_x - size,
-                y + size,
-            ]
-
-        elif direction == 2:
-            points = [
-                center_x - size,
-                y - size,
-                center_x,
-                y,
-                center_x + size,
-                y - size,
-                center_x + size / 2,
-                y - size,
-                center_x + size / 2,
-                y + size,
-                center_x - size / 2,
-                y + size,
-                center_x - size / 2,
-                y - size,
-            ]
-
-        else:
-            points = [
-                center_x - size,
-                y,
-                center_x,
-                y - size,
-                center_x + size,
-                y,
-                center_x + size / 2,
-                y + size,
-                center_x - size / 2,
-                y + size,
-            ]
-
-        self.canvas.create_polygon(
-            points,
-            fill="#ff3030",
-            outline="#ffffff",
-            width=2,
-        )
-
-    # =========================================================
-    # MISSES
-    # =========================================================
-
-    def process_misses(self, position):
-        miss_window = 0.17
-
-        for note in self.active_notes:
-            if note["hit"] or note["missed"]:
-                continue
-
-            if (
-                position
-                - note["time"]
-                > miss_window
-            ):
-                note["missed"] = True
-
-                self.combo = 0
-                self.misses += 1
-                self.total_judged += 1
-
-                self.add_hit_effect(
-                    note["lane"],
-                    "MISS",
-                )
-
-    # =========================================================
-    # KEY INPUT
-    # =========================================================
-
-    def handle_key(self, event):
-        key = event.keysym.lower()
-
-        if self.screen == "game":
-            if key == "escape":
-                self.pause_game()
-                return
-
-            for lane in range(4):
-                if key == self.keys[lane]:
-                    self.hit_lane(lane)
-                    return
-
-        elif self.screen == "pause":
-            if key == "escape":
-                self.resume_game()
+    # ========================================================
 
     def hit_lane(self, lane):
         position = self.audio.get_position()
 
-        self.key_glow[lane] = 8
+        candidates = []
 
-        best_note = None
-        best_difference = 999.0
-
-        for note in self.active_notes:
-            if note["hit"] or note["missed"]:
-                continue
-
+        for note in self.notes:
             if note["lane"] != lane:
                 continue
 
-            difference = abs(
-                note["time"]
-                - position
+            if note["hit"] or note["missed"]:
+                continue
+
+            difference = (
+                note["time"] -
+                position
             )
 
-            if difference < best_difference:
-                best_difference = difference
-                best_note = note
+            if abs(difference) <= 0.16:
+                candidates.append(
+                    (
+                        abs(difference),
+                        note
+                    )
+                )
 
-        if (
-            best_note is None
-            or best_difference > 0.150
-        ):
-            self.add_hit_effect(
-                lane,
-                "NO NOTE",
-            )
+        if not candidates:
+            # Pressing when no note is present does nothing.
             return
 
-        best_note["hit"] = True
+        candidates.sort(
+            key=lambda item: item[0]
+        )
 
-        if best_difference <= 0.025:
+        difference, note = (
+            candidates[0]
+        )
+
+        error_ms = abs(
+            difference
+        ) * 1000.0
+
+        if error_ms <= 25:
             judgement = "PERFECT"
             points = 300
+            self.perfects += 1
 
-        elif best_difference <= 0.060:
+        elif error_ms <= 60:
             judgement = "GREAT"
             points = 200
+            self.greats += 1
 
-        elif best_difference <= 0.100:
+        elif error_ms <= 100:
             judgement = "GOOD"
             points = 100
+            self.goods += 1
+
+        elif error_ms <= 150:
+            judgement = "OK"
+            points = 50
+            self.okays += 1
 
         else:
-            judgement = "GOOD"
-            points = 50
+            return
 
-        self.score += (
-            points
-            + self.combo * 5
-        )
+        note["hit"] = True
+        note["judgement"] = judgement
 
         self.combo += 1
 
-        if self.combo > self.max_combo:
-            self.max_combo = self.combo
-
-        self.hits += 1
-        self.total_judged += 1
-
-        self.add_hit_effect(
-            lane,
-            judgement,
+        self.max_combo = max(
+            self.max_combo,
+            self.combo
         )
 
-    # =========================================================
-    # EFFECTS
-    # =========================================================
-
-    def add_hit_effect(
-        self,
-        lane,
-        text_value,
-    ):
-        self.hit_effects.append(
-            {
-                "lane": lane,
-                "text": text_value,
-                "life": 20,
-            }
+        bonus = min(
+            self.combo * 2,
+            500
         )
 
-    def draw_hit_effects(self):
+        self.score += (
+            points +
+            bonus
+        )
+
+    def check_misses(self, position):
+        for note in self.notes:
+            if (
+                note["hit"]
+                or
+                note["missed"]
+            ):
+                continue
+
+            if (
+                position -
+                note["time"]
+            ) > 0.15:
+
+                note["missed"] = True
+                note["judgement"] = "MISS"
+
+                self.misses += 1
+                self.combo = 0
+
+    # ========================================================
+    # GAME DRAWING
+    # ========================================================
+
+    def draw_game(self):
+        if self.screen != "game":
+            return
+
         width = self.canvas.winfo_width()
-        lane_width = min(
-            130,
-            width / 5.2,
+        height = self.canvas.winfo_height()
+
+        if width <= 1:
+            return
+
+        position = self.audio.get_position()
+
+        self.check_misses(
+            position
+        )
+
+        if (
+            self.duration > 0
+            and
+            position >= self.duration
+        ):
+            self.finish_game()
+            return
+
+        # Game area.
+        game_width = min(
+            560,
+            width * 0.62
         )
 
         left = (
-            width
-            - lane_width * 4
+            width -
+            game_width
         ) / 2
 
-        hit_y = (
-            self.canvas.winfo_height()
-            - 125
+        right = (
+            width +
+            game_width
+        ) / 2
+
+        top = 80
+        hit_y = height - 130
+
+        lane_width = (
+            game_width /
+            LANES
         )
 
-        remaining = []
+        # Header.
+        self.canvas.create_text(
+            30,
+            25,
+            anchor="w",
+            text=f"Score: {self.score}",
+            fill="white",
+            font=(
+                "Arial",
+                16,
+                "bold"
+            )
+        )
 
-        for effect in self.hit_effects:
-            life = effect["life"]
+        self.canvas.create_text(
+            width - 30,
+            25,
+            anchor="e",
+            text=f"Combo: {self.combo}",
+            fill="white",
+            font=(
+                "Arial",
+                16,
+                "bold"
+            )
+        )
 
+        # Song title.
+        self.canvas.create_text(
+            width / 2,
+            25,
+            text=self.song_name,
+            fill="#bbbbbb",
+            font=(
+                "Arial",
+                11
+            )
+        )
+
+        # Lanes.
+        for lane in range(LANES):
+            x1 = (
+                left +
+                lane *
+                lane_width
+            )
+
+            x2 = (
+                x1 +
+                lane_width
+            )
+
+            lane_color = (
+                "#260000"
+                if not self.pressed[lane]
+                else "#750000"
+            )
+
+            self.canvas.create_rectangle(
+                x1,
+                top,
+                x2,
+                hit_y + 45,
+                fill=lane_color,
+                outline="#4b0000"
+            )
+
+        # Hit line.
+        self.canvas.create_rectangle(
+            left,
+            hit_y - 5,
+            right,
+            hit_y + 5,
+            fill="white",
+            outline=""
+        )
+
+        # Key labels.
+        for lane in range(LANES):
             x = (
-                left
-                + effect["lane"]
-                * lane_width
-                + lane_width / 2
+                left +
+                lane *
+                lane_width +
+                lane_width / 2
+            )
+
+            self.canvas.create_text(
+                x,
+                hit_y + 28,
+                text=self.keys[lane].upper(),
+                fill="white",
+                font=(
+                    "Arial",
+                    16,
+                    "bold"
+                )
+            )
+
+        # Notes.
+        travel_time = (
+            600 /
+            self.note_speed
+        )
+
+        for note in self.notes:
+            if (
+                note["hit"]
+                or
+                note["missed"]
+            ):
+                continue
+
+            time_until = (
+                note["time"] -
+                position
+            )
+
+            if time_until < -0.2:
+                continue
+
+            if time_until > travel_time:
+                continue
+
+            progress = (
+                1.0 -
+                max(
+                    0.0,
+                    time_until /
+                    travel_time
+                )
             )
 
             y = (
-                hit_y
-                - (20 - life)
-            )
-
-            self.text(
-                x,
-                y,
-                effect["text"],
-                15,
-                "#ffffff",
-            )
-
-            effect["life"] -= 1
-
-            if effect["life"] > 0:
-                remaining.append(
-                    effect
+                top +
+                progress *
+                (
+                    hit_y -
+                    top
                 )
+            )
 
-        self.hit_effects = remaining
+            x1 = (
+                left +
+                note["lane"] *
+                lane_width +
+                8
+            )
 
-        for i in range(4):
-            if self.key_glow[i] > 0:
-                self.key_glow[i] -= 1
+            x2 = (
+                left +
+                (
+                    note["lane"] +
+                    1
+                ) *
+                lane_width -
+                8
+            )
 
-    # =========================================================
+            self.draw_arrow(
+                x1,
+                x2,
+                y,
+                22
+            )
+
+        # Progress.
+        if self.duration > 0:
+            progress = min(
+                1.0,
+                position /
+                self.duration
+            )
+
+            self.canvas.create_rectangle(
+                20,
+                height - 25,
+                width - 20,
+                height - 20,
+                fill="#350000",
+                outline=""
+            )
+
+            self.canvas.create_rectangle(
+                20,
+                height - 25,
+                20 +
+                (
+                    width -
+                    40
+                ) *
+                progress,
+                height - 20,
+                fill="white",
+                outline=""
+            )
+
+        # Pause hint.
+        self.canvas.create_text(
+            width / 2,
+            height - 50,
+            text="ESC = PAUSE",
+            fill="#888888",
+            font=(
+                "Arial",
+                10
+            )
+        )
+
+    def draw_arrow(
+        self,
+        x1,
+        x2,
+        y,
+        half_height
+    ):
+        center = (
+            x1 + x2
+        ) / 2
+
+        width = (
+            x2 - x1
+        )
+
+        points = [
+            x1,
+            y - half_height * 0.35,
+
+            center,
+            y + half_height,
+
+            x2,
+            y - half_height * 0.35,
+
+            x2,
+            y - half_height,
+
+            center,
+            y - half_height * 0.05,
+
+            x1,
+            y - half_height,
+        ]
+
+        self.canvas.create_polygon(
+            points,
+            fill="white",
+            outline="#dddddd"
+        )
+
+    # ========================================================
     # PAUSE
-    # =========================================================
+    # ========================================================
 
     def pause_game(self):
         if self.screen != "game":
@@ -2437,9 +2753,43 @@ class ManiaTK:
 
         self.audio.pause()
 
-        self.screen = "pause"
+        self.set_screen(
+            "pause"
+        )
 
-    def draw_pause_overlay(self):
+        self.make_label(
+            "PAUSED",
+            0.5,
+            0.25,
+            font=(
+                "Arial",
+                40,
+                "bold"
+            )
+        )
+
+        self.make_button(
+            "RESUME",
+            self.resume_game,
+            0.5,
+            0.43
+        )
+
+        self.make_button(
+            "QUIT BEATMAP",
+            self.quit_beatmap,
+            0.5,
+            0.54
+        )
+
+        self.make_button(
+            "MAIN MENU",
+            self.quit_to_menu,
+            0.5,
+            0.65
+        )
+
+    def draw_pause(self):
         width = self.canvas.winfo_width()
         height = self.canvas.winfo_height()
 
@@ -2448,412 +2798,130 @@ class ManiaTK:
             0,
             width,
             height,
-            fill="#080000",
+            fill="#170000",
             stipple="gray50",
-            outline="",
-        )
-
-        cx = width / 2
-
-        self.text(
-            cx,
-            height / 2 - 100,
-            "PAUSED",
-            42,
-        )
-
-        self.button(
-            cx - 170,
-            height / 2 - 40,
-            cx + 170,
-            height / 2 + 10,
-            "RESUME",
-            self.resume_game,
-        )
-
-        self.button(
-            cx - 170,
-            height / 2 + 25,
-            cx + 170,
-            height / 2 + 75,
-            "QUIT BEATMAP",
-            self.quit_game,
+            outline=""
         )
 
     def resume_game(self):
         if self.screen != "pause":
             return
 
-        self.audio.resume()
+        self.set_screen(
+            "game"
+        )
 
-        self.screen = "game"
+        try:
+            self.audio.resume()
+        except Exception as e:
+            messagebox.showerror(
+                "Audio Error",
+                str(e)
+            )
+            self.show_menu()
 
-    def quit_game(self):
+    def quit_beatmap(self):
         self.audio.stop()
-
-        self.screen = "menu"
-
         self.show_menu()
 
-    # =========================================================
+    def quit_to_menu(self):
+        self.audio.stop()
+        self.show_menu()
+
+    # ========================================================
     # RESULTS
-    # =========================================================
+    # ========================================================
 
     def finish_game(self):
-        if self.game_finished:
+        if self.screen != "game":
             return
-
-        self.game_finished = True
 
         self.audio.stop()
 
         self.screen = "results"
 
-        self.show_results()
+        self.clear_widgets()
 
-    def show_results(self):
-        self.clear()
-
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
-        cx = width / 2
-
-        accuracy = 0.0
-
-        if self.total_judged > 0:
-            accuracy = (
-                self.hits
-                / self.total_judged
-                * 100
-            )
-
-        self.text(
-            cx,
-            75,
+        self.make_label(
             "RESULTS",
-            42,
+            0.5,
+            0.10,
+            font=(
+                "Arial",
+                36,
+                "bold"
+            )
         )
 
-        self.text(
-            cx,
-            145,
-            f"SCORE: {self.score}",
-            24,
+        total = (
+            self.perfects +
+            self.greats +
+            self.goods +
+            self.okays +
+            self.misses
         )
 
-        self.text(
-            cx,
-            190,
-            f"ACCURACY: {accuracy:.2f}%",
-            22,
-            "#ffaaaa",
+        if total > 0:
+            accuracy = (
+                (
+                    self.perfects * 100
+                    +
+                    self.greats * 66.6667
+                    +
+                    self.goods * 33.3333
+                    +
+                    self.okays * 16.6667
+                )
+                /
+                total
+            )
+        else:
+            accuracy = 0.0
+
+        result_text = (
+            f"Score: {self.score}\n\n"
+            f"Accuracy: {accuracy:.2f}%\n\n"
+            f"Max Combo: {self.max_combo}\n\n"
+            f"Perfect: {self.perfects}\n"
+            f"Great: {self.greats}\n"
+            f"Good: {self.goods}\n"
+            f"OK: {self.okays}\n"
+            f"Miss: {self.misses}\n\n"
+            f"BPM: {self.bpm:.1f}"
         )
 
-        self.text(
-            cx,
-            235,
-            f"MAX COMBO: {self.max_combo}",
-            20,
+        self.make_label(
+            result_text,
+            0.5,
+            0.48,
+            font=(
+                "Arial",
+                15
+            )
         )
 
-        self.text(
-            cx,
-            280,
-            f"HITS: {self.hits}",
-            18,
-        )
-
-        self.text(
-            cx,
-            315,
-            f"MISSES: {self.misses}",
-            18,
-        )
-
-        self.text(
-            cx,
-            350,
-            f"BPM: {self.bpm:.1f}",
-            16,
-            "#bbbbbb",
-        )
-
-        self.text(
-            cx,
-            380,
-            f"Difficulty: {self.difficulty}",
-            16,
-            "#bbbbbb",
-        )
-
-        self.button(
-            cx - 180,
-            height - 130,
-            cx + 180,
-            height - 80,
+        self.make_button(
             "PLAY AGAIN",
             self.start_game,
+            0.5,
+            0.79,
+            width=220
         )
 
-        self.button(
-            cx - 180,
-            height - 70,
-            cx + 180,
-            height - 20,
+        self.make_button(
             "MAIN MENU",
             self.show_menu,
+            0.5,
+            0.88,
+            width=220
         )
 
-    # =========================================================
-    # YOUTUBE
-    # =========================================================
+    def draw_results(self):
+        pass
 
-    def import_youtube(self):
-        if self.youtube_window is not None:
-            try:
-                self.youtube_window.destroy()
-            except Exception:
-                pass
-
-        self.youtube_window = tk.Toplevel(
-            self.root
-        )
-
-        self.youtube_window.title(
-            "YouTube Import"
-        )
-
-        self.youtube_window.geometry(
-            "600x230"
-        )
-
-        self.youtube_window.configure(
-            bg="#080000"
-        )
-
-        tk.Label(
-            self.youtube_window,
-            text="Paste YouTube URL",
-            bg="#080000",
-            fg="white",
-            font=("Arial", 18, "bold"),
-        ).pack(
-            pady=20
-        )
-
-        entry = tk.Entry(
-            self.youtube_window,
-            width=65,
-            bg="#180000",
-            fg="white",
-            insertbackground="white",
-        )
-
-        entry.pack(
-            padx=20,
-            pady=5,
-        )
-
-        status = tk.Label(
-            self.youtube_window,
-            text="",
-            bg="#080000",
-            fg="#ffaaaa",
-        )
-
-        status.pack(
-            pady=10
-        )
-
-        self.youtube_status = status
-
-        tk.Button(
-            self.youtube_window,
-            text="DOWNLOAD",
-            command=lambda: self.download_youtube(
-                entry.get().strip()
-            ),
-            bg="#300000",
-            fg="white",
-            activebackground="#550000",
-            activeforeground="white",
-        ).pack(
-            pady=5
-        )
-
-    def download_youtube(self, url):
-        if not url:
-            messagebox.showerror(
-                "YouTube",
-                "Paste a YouTube link first.",
-                parent=self.youtube_window,
-            )
-            return
-
-        if self.youtube_status:
-            self.youtube_status.config(
-                text="Downloading..."
-            )
-
-        threading.Thread(
-            target=self.youtube_worker,
-            args=(url,),
-            daemon=True,
-        ).start()
-
-    def youtube_worker(self, url):
-        try:
-            try:
-                import yt_dlp
-            except ImportError:
-                raise RuntimeError(
-                    "yt-dlp is not installed.\n\n"
-                    "Run:\n"
-                    "py -3.14 -m pip install -U \"yt-dlp[default]\""
-                )
-
-            temp_dir = tempfile.mkdtemp(
-                prefix="maniatk_youtube_"
-            )
-
-            output_template = os.path.join(
-                temp_dir,
-                "youtube_audio.%(ext)s",
-            )
-
-            options = {
-                "format": (
-                    "bestaudio[ext=m4a]"
-                    "/bestaudio/best"
-                ),
-                "outtmpl": output_template,
-                "noplaylist": True,
-                "quiet": True,
-                "no_warnings": True,
-                "restrictfilenames": True,
-            }
-
-            with yt_dlp.YoutubeDL(
-                options
-            ) as ydl:
-                info = ydl.extract_info(
-                    url,
-                    download=True,
-                )
-
-                downloaded = (
-                    ydl.prepare_filename(
-                        info
-                    )
-                )
-
-            if not os.path.isfile(
-                downloaded
-            ):
-                files = os.listdir(
-                    temp_dir
-                )
-
-                media_files = [
-                    os.path.join(
-                        temp_dir,
-                        x,
-                    )
-                    for x in files
-                    if x.lower().endswith(
-                        (
-                            ".m4a",
-                            ".webm",
-                            ".mp3",
-                            ".opus",
-                        )
-                    )
-                ]
-
-                if not media_files:
-                    raise RuntimeError(
-                        "YouTube audio download completed "
-                        "but no audio file was found."
-                    )
-
-                downloaded = media_files[0]
-
-            self.root.after(
-                0,
-                lambda: self.youtube_download_finished(
-                    downloaded,
-                    info.get(
-                        "title",
-                        "YouTube song",
-                    ),
-                ),
-            )
-
-        except Exception as exc:
-            self.root.after(
-                0,
-                lambda e=exc: self.youtube_failed(e),
-            )
-
-    def youtube_download_finished(
-        self,
-        filename,
-        title,
-    ):
-        if self.youtube_window:
-            try:
-                self.youtube_window.destroy()
-            except Exception:
-                pass
-
-            self.youtube_window = None
-
-        self.song_file = filename
-        self.song_name = title
-
-        self.start_analysis()
-
-    def youtube_failed(self, error):
-        if self.youtube_status:
-            try:
-                self.youtube_status.config(
-                    text="Download failed."
-                )
-            except Exception:
-                pass
-
-        messagebox.showerror(
-            "YouTube download failed",
-            str(error),
-        )
-
-    # =========================================================
-    # UPDATE CHECK
-    # =========================================================
-
-    def check_update(self):
-        try:
-            with urllib.request.urlopen(
-                GITHUB_VERSION_URL,
-                timeout=5,
-            ) as response:
-                remote = (
-                    response.read()
-                    .decode()
-                    .strip()
-                )
-
-            if remote != GAME_VERSION:
-                return remote
-
-        except Exception:
-            pass
-
-        return None
-
-    # =========================================================
+    # ========================================================
     # CLOSE
-    # =========================================================
+    # ========================================================
 
     def close(self):
         try:
@@ -2862,38 +2930,17 @@ class ManiaTK:
             pass
 
         try:
-            if self.wav_file:
-                folder = os.path.dirname(
-                    self.wav_file
-                )
-
-                if folder.startswith(
-                    tempfile.gettempdir()
-                ):
-                    shutil.rmtree(
-                        folder,
-                        ignore_errors=True,
-                    )
-        except Exception:
-            pass
-
-        try:
             self.root.destroy()
         except Exception:
             pass
 
-    # =========================================================
-    # START
-    # =========================================================
-
     def run(self):
-        self.root.bind(
-            "<KeyPress>",
-            self.handle_key,
-        )
-
         self.root.mainloop()
 
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
     app = ManiaTK()
